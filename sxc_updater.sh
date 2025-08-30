@@ -15,91 +15,86 @@ APPIMAGE_NAME="simplex-desktop-x86_64.AppImage"
 APPIMAGE_PATH="$TARGET_DIR/$APPIMAGE_NAME"
 INCLUDE_PRERELEASE=true # Állítsa False-ra, ha nem szeretne pre-release-t telepíteni, csak stable/latest-et
 
-# Verzióösszehasonlító-függvény
+# Verzióösszehasonlító-függvény (sort -V használatával)
+# Ez a függvény helyesen kezeli a "v6.4.4" és "v6.4.4-beta.0" formátumokat
 version_compare() {
-    local v1=$(echo "$1" | sed 's/^v//;s/-.*//')
-    local v2=$(echo "$2" | sed 's/^v//;s/-.*//')
-    
-    # Dátum kinyerése a kiadásból (ISO 8601 formátum)
-    local date1=$(grep -A 10 "\"tag_name\": \"$1\"" <<< "$releases" | grep '"published_at"' | cut -d '"' -f 4)
-    local date2=$(grep -A 10 "\"tag_name\": \"$2\"" <<< "$releases" | grep '"published_at"' | cut -d '"' -f 4)
-    
-    # Numerikus verzióösszehasonlítás
-    local IFS=.
-    local i ver1=($v1) ver2=($v2)
-    for ((i=${#ver1[@]}; i<${#ver2[@]}; i++)); do
-        ver1[i]=0
-    done
-    for ((i=0; i<${#ver1[@]}; i++)); do
-        if [[ -z ${ver2[i]} ]]; then
-            ver2[i]=0
-        fi
-        if ((10#${ver1[i]} > 10#${ver2[i]})); then
-            return 0
-        elif ((10#${ver1[i]} < 10#${ver2[i]})); then
-            return 1
-        fi
-    done
-    
-    # Ha a verziószámok megegyeznek, dátum alapján dönt
-    [[ "$date1" > "$date2" ]]
+    # Összehasonlítja, hogy $1 újabb vagy egyenlő-e $2-vel
+    # A `sort -V` rendezi a verziószámokat, a `tail -n1` visszaadja a legnagyobbat.
+    # Ha a legnagyobb verzió megegyezik az elsővel ($1), akkor az $1 >= $2.
+    [ "$(printf '%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]
 }
 
 # Könyvtárak létrehozása
 mkdir -p "$TARGET_DIR"
 mkdir -p "$(dirname "$DESKTOP_FILE")"
 
-# Jelenlegi verzió lekérdezése
+# Jelenlegi verzió lekérdezése (a teljes verziószámot olvassa ki)
 current_version=""
 if [ -f "$DESKTOP_FILE" ]; then
-    current_version=$(grep -oP 'Version=\Kv[0-9.]+' "$DESKTOP_FILE" || echo "")
+    # A regex-et javítottuk, hogy a teljes verziószámot kinyerje (pl. v5.5.0-beta.2)
+    current_version=$(grep -oP 'Version=\K.*' "$DESKTOP_FILE" || echo "")
 fi
 
 echo -e "\n${YELLOW}Új verzió keresése...${NC}\n"
 
 # Kiadási információk letöltése
-releases=$(curl -s "$API_URL")
-
-# Legújabb verzió keresése
-find_latest_release() {
-    local latest_tag=""
-    local latest_url=""
-    local latest_date=""
+# A jq használata sokkal stabilabb és egyszerűbb, mint a manuális feldolgozás
+# Ha nincs telepítve a jq, a szkript a régi, grep alapú módszert használja
+if command -v jq &> /dev/null; then
+    releases_json=$(curl -s "$API_URL")
+    if [[ "$INCLUDE_PRERELEASE" != "true" ]]; then
+        releases_json=$(jq 'map(select(.prerelease == false))' <<< "$releases_json")
+    fi
+    # A kiadásokat a verziószám alapján rendezi a jq és a sort -V segítségével
+    latest_release_info=$(jq -r '.[].tag_name' <<< "$releases_json" | sort -V | tail -n1)
     
-    # Feldolgoz minden kiadást
-    while read -r line; do
-        if [[ $line =~ \"tag_name\":\ \"([^\"]+)\" ]]; then
-            current_tag="${BASH_REMATCH[1]}"
-            prerelease=false
-        elif [[ $line =~ \"prerelease\":\ true ]]; then
-            prerelease=true
-        elif [[ $line =~ \"published_at\":\ \"([^\"]+)\" ]]; then
-            current_date="${BASH_REMATCH[1]}"
-        elif [[ $line =~ \"browser_download_url\":\ \"([^\"]*$APPIMAGE_NAME[^\"]*)\" ]]; then
-            current_url="${BASH_REMATCH[1]}"
-            
-            if [[ -n "$current_tag" && -n "$current_url" ]]; then
-                if [[ "$INCLUDE_PRERELEASE" == "true" || "$prerelease" == "false" ]]; then
-                    if [[ -z "$latest_tag" ]] || version_compare "$current_tag" "$latest_tag"; then
+    if [ -n "$latest_release_info" ]; then
+        latest_version="$latest_release_info"
+        appimage_url=$(jq -r --arg tag "$latest_version" '.[] | select(.tag_name == $tag) | .assets[] | select(.name | endswith("x86_64.AppImage")) | .browser_download_url' <<< "$releases_json")
+        latest_release="${latest_version}|${appimage_url}"
+    else
+        latest_release=""
+    fi
+else
+    # Régi módszer, ha a jq nem elérhető
+    releases=$(curl -s "$API_URL")
+    find_latest_release() {
+        local latest_tag=""
+        local latest_url=""
+        
+        # A kiadások feldolgozása a jq helyett grep/sed párossal
+        local tags_and_urls=$(echo "$releases" | grep -oP '(?<="tag_name": ")[^"]*|(?<="prerelease": )(true|false)|(?<="browser_download_url": ")[^"]*' | grep -E "($APPIMAGE_NAME|v[0-9]|\btrue\b|\bfalse\b)")
+        
+        local current_tag=""
+        local prerelease_status=""
+        
+        while read -r line; do
+            if [[ "$line" =~ ^v[0-9] ]]; then
+                current_tag=$line
+            elif [[ "$line" == "true" || "$line" == "false" ]]; then
+                prerelease_status=$line
+            elif [[ "$line" == *"$APPIMAGE_NAME" ]]; then
+                if [[ "$INCLUDE_PRERELEASE" == "true" || "$prerelease_status" == "false" ]]; then
+                    if [[ -z "$latest_tag" ]] || ! version_compare "$latest_tag" "$current_tag"; then
                         latest_tag="$current_tag"
-                        latest_url="$current_url"
-                        latest_date="$current_date"
+                        latest_url="$line"
                     fi
                 fi
             fi
+        done <<< "$tags_and_urls"
+        
+        if [[ -n "$latest_tag" ]]; then
+            echo "${latest_tag}|${latest_url}"
+        else
+            echo ""
         fi
-    done <<< "$releases"
-    
-    if [[ -n "$latest_tag" ]]; then
-        echo "${latest_tag}|${latest_url}"
-    else
-        echo ""
-    fi
-}
+    }
+    latest_release=$(find_latest_release)
+fi
 
-latest_release=$(find_latest_release)
-if [ -z "$latest_release" ]; then
-    echo -e "${RED}Hiba: Nem található érvényes release${NC}\n"
+
+if [ -z "$latest_release" ] || [ -z "$(echo "$latest_release" | cut -d'|' -f2)" ]; then
+    echo -e "${RED}Hiba: Nem található érvényes release vagy letöltési URL.${NC}\n"
     exit 1
 fi
 
@@ -108,7 +103,7 @@ appimage_url=$(echo "$latest_release" | cut -d'|' -f2)
 
 echo -e "Telepített verzió: ${GREEN}${current_version:-Nincs}${NC}"
 echo -e "Elérhető legújabb verzió: ${GREEN}$latest_version${NC}"
-if [[ "$latest_version" == *"beta"* || "$latest_version" == *"alpha"* ]]; then
+if [[ "$latest_version" == *"beta"* || "$latest_version" == *"alpha"* || "$latest_version" == *"rc"* ]]; then
     echo -e "${YELLOW}Figyelem: Ez egy pre-release verzió!${NC}"
 fi
 echo ""
@@ -126,7 +121,7 @@ if [[ "$current_version" == "$latest_version" ]]; then
     fi
     echo -e "${YELLOW}Kényszerített frissítés...${NC}\n"
 else
-    if version_compare "$current_version" "$latest_version"; then
+    if [[ -n "$current_version" ]] && version_compare "$current_version" "$latest_version"; then
         echo -e "${YELLOW}Figyelem: A telepített verzió ($current_version) újabbnak tűnik, mint a legújabb kiadás ($latest_version)!${NC}"
         echo -ne "${YELLOW}Folytatja a frissítést?${NC} [i/N] "
         read -r downgrade
@@ -163,20 +158,31 @@ echo -e "Fájl futtathatóvá tétele: ${GREEN}kész${NC}\n"
 
 # Desktop fájl frissítése
 echo -e "${YELLOW}.desktop fájl frissítése...${NC}"
+# Az Icon útvonalát javítottam, feltételezve, hogy az ikon a TARGET_DIR-ben van
 cat > "$DESKTOP_FILE" <<EOL
 [Desktop Entry]
 Version=$latest_version
-Name=SimpleX Chat $latest_version
+Name=SimpleX Chat
 Comment=Private and secure open-source messenger - no user IDs
-Exec=$APPIMAGE_PATH
-Icon=$TARGET_DIR/SimpleX.png
+Exec=$APPIMAGE_PATH %U
+Icon=$TARGET_DIR/simplex.png
 StartupWMClass=chat-simplex-desktop-MainKt
 Type=Application
 Terminal=false
 Categories=Network;Chat;
 EOL
 
+# Ikon letöltése, ha még nem létezik (opcionális, de ajánlott)
+if [ ! -f "$TARGET_DIR/simplex.png" ]; then
+    echo -e "${YELLOW}Ikon letöltése...${NC}"
+    wget -q "https://raw.githubusercontent.com/simplex-chat/simplex-chat/stable/apps/desktop/assets/icon.png" -O "$TARGET_DIR/simplex.png"
+    echo -e "Ikon letöltve: ${GREEN}kész${NC}\n"
+fi
+
+
 echo -e ".desktop fájl frissítve: ${GREEN}kész${NC}\n"
+# Asztali adatbázis frissítése, hogy a változások azonnal megjelenjenek
+update-desktop-database -q "$HOME/.local/share/applications"
 
 echo -e "${GREEN}A frissítés sikeresen befejeződött!${NC}\n"
 echo -e "Új verzió: ${GREEN}$latest_version${NC}"
